@@ -475,6 +475,12 @@ pub fn attach_track(tracker: &PropGroup) -> Vec<(Tick, Vec<[f64; 2]>)> {
 
 /// Apply a tracker (Tracker panel ▸ Apply). Returns the number of keyframed frames.
 pub fn apply(p: &mut Project, cid: ItemId, src: LayerId, tracker: Uid, dims: Dims) -> Result<usize, String> {
+    apply_point(p, cid, src, tracker, dims, 1)
+}
+
+/// Apply using a particular 1-based attach point for Transform position.
+/// All other tracker types keep their original first-point behavior.
+pub fn apply_point(p: &mut Project, cid: ItemId, src: LayerId, tracker: Uid, dims: Dims, point: usize) -> Result<usize, String> {
     let comp = p.comp(cid).ok_or("no composition")?.clone();
     let source = comp.layer(src).ok_or("no source layer")?.clone();
     let (tg, settings) = source.tracker(tracker).ok_or("no such tracker")?;
@@ -482,6 +488,9 @@ pub fn apply(p: &mut Project, cid: ItemId, src: LayerId, tracker: Uid, dims: Dim
     let track = attach_track(tg);
     if track.is_empty() {
         return Err("analyze the track first".into());
+    }
+    if point == 0 || (settings.kind != TrackKind::Transform && point != 1) || track.iter().any(|(_, pts)| pts.get(point - 1).is_none()) {
+        return Err("the chosen track point has no analyzed samples".into());
     }
     let target_id = match settings.kind {
         TrackKind::Stabilize => src,
@@ -535,7 +544,8 @@ pub fn apply(p: &mut Project, cid: ItemId, src: LayerId, tracker: Uid, dims: Dim
             TrackKind::Transform => {
                 let (m, _) = ctx.layer_to_comp(&source);
                 if settings.position {
-                    let c = apply_m(&m, pts[0]);
+                    let attach = pts.get(point - 1).copied().ok_or("the chosen track point has no data at this frame")?;
+                    let c = apply_m(&m, attach);
                     let pp = apply_m(&comp_to_parent(&ctx, &target), c);
                     pos_keys.push((tt, dims.mix(ctx.position(&target, ttr), pp)));
                 }
