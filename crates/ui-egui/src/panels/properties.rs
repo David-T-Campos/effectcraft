@@ -71,6 +71,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut y = top;
     let mut actions: Actions = vec![];
 
+    // A link lives on its source tracker; look across the composition, not just the
+    // currently selected layer. References are stable across saving and undo/redo.
+    let linked = comp.layers.iter().find_map(|source| {
+        source.trackers().find_map(|(tracker, settings)| {
+            settings.link.as_ref().filter(|link| link.target == layer.id).map(|link| (source, tracker, settings, link))
+        })
+    });
+
     // ---------------------------------------------------------------- Layer Transform
     if let Some(tr) = layer.transform().cloned() {
         section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
@@ -88,8 +96,71 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             if pr.three_d_only && !layer.is_3d() {
                 continue;
             }
-            transform_row(app, ui, &p, &layer, pr, &ectx, Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &mut actions);
+            let tracked = linked.as_ref().is_some_and(|(_, _, st, _)| match pr.match_id.as_str() {
+                "position" | "positionX" | "positionY" => st.position,
+                "rotation" => st.rotation,
+                "scale" => st.scale,
+                _ => false,
+            });
+            transform_row(app, ui, &p, &layer, pr, &ectx, Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &mut actions, tracked);
             y += ROW_H;
+        }
+        // Link UI next to the destination's transform properties, not hidden in
+        // the source clip's Tracker panel. The operation bakes editable keyframes.
+        section_header(app, ui, &p, x0, w, y + 4.0, "Link to Motion Tracker", "properties.track");
+        y += ROW_H + 4.0;
+        let mut choices = vec![];
+        for source in &comp.layers {
+            if source.id == layer.id {
+                continue;
+            }
+            for (tracker, settings) in source.trackers() {
+                if settings.kind != effectcraft_engine::project::tracking::TrackKind::Transform || settings.link.is_some() {
+                    continue;
+                }
+                for (i, point) in tracker.track_points().enumerate() {
+                    if point.get("attachPoint").is_some_and(|pr| !pr.keys.is_empty()) {
+                        choices.push((source.id, tracker.uid, i + 1, format!("{} / {} / {}", source.name, tracker.name, point.name)));
+                    }
+                }
+            }
+        }
+        let pick = egui::Id::new(("properties-track-picker", layer.id.0));
+        let rr = Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H));
+        let display = linked
+            .as_ref()
+            .map(|(source, tracker, _, link)| format!("Linked: {} / {} / point {}", source.name, tracker.name, link.point))
+            .unwrap_or_else(|| if choices.is_empty() { "No analyzed trackers".into() } else { "Choose a tracked point...".into() });
+        if widgets::dropdown(ui, rr, &display, &t, pick).clicked() && linked.is_none() && !choices.is_empty() {
+            widgets::open_popup(ui, pick);
+        }
+        app.auto.add("properties.track.link", rr, "Link to a tracked point (bake keyframes)");
+        if linked.is_none() {
+            let labels: Vec<String> = choices.iter().map(|(_, _, _, name)| name.clone()).collect();
+            if let Some(i) = widgets::popup_menu(ui, pick, rr.left_bottom(), &labels, None)
+                && let Some((source, tracker, point, _)) = choices.get(i)
+            {
+                actions.push(("track.link".into(), json!({"layer": source.0, "tracker": tracker, "target": layer.id.0, "point": point})));
+            }
+        }
+        y += ROW_H + 2.0;
+        if let Some((source, tracker, _, link)) = linked {
+            let update = Rect::from_min_size(pos2(x0, y), vec2(72.0, ROW_H));
+            app.auto.add("properties.track.update", update, "Reapply current tracker data");
+            if widgets::text_button(ui, update, "Update", false, &t, egui::Id::new("properties-track-update")).clicked() {
+                actions.push(("track.link".into(), json!({"layer": source.id.0, "tracker": tracker.uid, "target": layer.id.0, "point": link.point})));
+            }
+            let unlink = Rect::from_min_size(pos2(x0 + 78.0, y), vec2(72.0, ROW_H));
+            app.auto.add("properties.track.unlink", unlink, "Unlink and restore original transform");
+            if widgets::text_button(ui, unlink, "Unlink", false, &t, egui::Id::new("properties-track-unlink")).clicked() {
+                actions.push(("track.unlink".into(), json!({"layer": source.id.0, "tracker": tracker.uid})));
+            }
+            y += ROW_H + 2.0;
+            p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Baked keyframes; Update after re-tracking", Tokens::ui(11.0), t.text_faint);
+            y += 18.0;
+        } else if choices.is_empty() {
+            p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Analyze a clip in the Tracker panel first", Tokens::ui(11.0), t.text_faint);
+            y += 18.0;
         }
         y += 10.0;
     }
@@ -178,7 +249,7 @@ fn triangle(p: &egui::Painter, c: egui::Pos2, left: bool, col: Color32) {
 
 /// One transform row: keyframe navigator or stopwatch, name, value fields.
 #[allow(clippy::too_many_arguments)]
-fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, pr: &Property, ectx: &EvalCtx, r: Rect, actions: &mut Actions) {
+fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, pr: &Property, ectx: &EvalCtx, r: Rect, actions: &mut Actions, tracked: bool) {
     let t = app.tokens;
     let cy = r.center().y;
     let uid = pr.uid;
@@ -229,7 +300,12 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
             actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid})));
         }
     }
-    p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &pr.name, Tokens::ui(12.0), t.text);
+    if tracked {
+        let ir = Rect::from_center_size(pos2(r.min.x + 43.0, cy), vec2(10.0, 10.0));
+        icons::paint(p, ir, Icon::Link, t.accent);
+        app.auto.add(&format!("{base}.trackLink"), ir, "Linked to motion tracker (baked keyframes)");
+    }
+    p.text(pos2(r.min.x + if tracked { 52.0 } else { 42.0 }, cy), Align2::LEFT_CENTER, &pr.name, Tokens::ui(12.0), t.text);
     let vx = r.min.x + (r.width() * 0.5).max(130.0);
     let merge = format!("props-{uid}");
     let set = |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge})));
@@ -503,4 +579,4 @@ mod tests {
         assert_eq!(decimals(960.0), 0);
         assert_eq!(decimals(960.5), 1);
     }
-}
+                                                                   }
