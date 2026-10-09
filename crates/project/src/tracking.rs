@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::build::Ids;
 use crate::props::{GroupKind, ParamUi, PropGroup};
-use crate::{Layer, LayerId, Uid};
+use crate::{Layer, LayerId, Property, Uid};
 
 /// Tracker panel ▸ Track Type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -133,6 +133,17 @@ impl Default for TrackerOptions {
     }
 }
 
+/// A reversible, baked link from a tracker point to another layer's transform.
+/// The original property values, keyframes and expressions survive save/load.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackLink {
+    pub target: LayerId,
+    pub point: usize,
+    pub previous_target: Option<LayerId>,
+    pub originals: Vec<Property>,
+}
+
 /// A tracker's non-animatable settings (Tracker panel).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -141,6 +152,8 @@ pub struct TrackerSettings {
     pub position: bool,
     pub rotation: bool,
     pub scale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<TrackLink>,
     /// Motion Target (None: no target; Stabilize always applies to the tracked layer).
     pub target: Option<LayerId>,
     pub options: TrackerOptions,
