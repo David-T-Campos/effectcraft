@@ -6,7 +6,7 @@
 //! (group uid, name or 1-based index); both default to the Tracker panel's Current Track.
 
 use effectcraft_project::build::Ids;
-use effectcraft_project::tracking::{self, LowConfidence, TrackChannel, TrackKind, TrackerSettings};
+use effectcraft_project::tracking::{self, LowConfidence, TrackChannel, TrackKind, TrackLink, TrackerSettings};
 use effectcraft_project::{ItemId, Layer, LayerId, Node, PropGroup, Uid, Value};
 use effectcraft_time::Tick;
 use serde_json::json;
@@ -71,6 +71,8 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("track.stop", "Stop Analysis", [], None, "{}", is_tracking, |s, _| Ok(json!({"stopped": s.stop_track() | s.stop_mask_track() | s.stop_warp()}))),
         cmd!("track.apply", "Apply", [], None, "{layer?, tracker?, dimensions?: xy|x|y}", has_track, apply),
+        cmd!("track.link", "Link Layer to Track", [], None, "{layer?, tracker?, target: layer, point?: 1-based track point}", has_comp, link),
+        cmd!("track.unlink", "Unlink Layer from Track", [], None, "{layer?, tracker?}", has_comp, unlink),
         cmd!("track.reset", "Reset", [], None, "{layer?, tracker?}", has_track, reset),
         cmd!("track.delete", "Delete Tracker", [], None, "{layer?, tracker?}", has_track, delete),
         cmd!("track.editTargetDialog", "Edit Target...", [], None, "{}", has_track, |s, p| frontend(s, "track.editTargetDialog", p)),
@@ -148,6 +150,17 @@ pub(crate) fn current(s: &Session, p: &V, cmd: &str) -> Result<(ItemId, LayerId,
 
 fn tracker_mut(proj: &mut effectcraft_project::Project, cid: ItemId, lid: LayerId, uid: Uid) -> Result<&mut PropGroup> {
     layer_mut(proj, cid, lid)?.props.find_group_mut(uid).ok_or_else(|| EngineError::Other("tracker gone".into()))
+}
+
+/// Restore the destination transform before removing or reapplying a baked link.
+fn restore_link(proj: &mut effectcraft_project::Project, cid: ItemId, link: &TrackLink) {
+    if let Some(tr) = proj.comp_mut(cid).and_then(|c| c.layer_mut(link.target)).and_then(|l| l.transform_mut()) {
+        for original in &link.originals {
+            if let Some(prop) = tr.get_mut(&original.match_id) {
+                *prop = original.clone();
+            }
+        }
+    }
 }
 
 fn layer_size(s: &Session, cid: ItemId, l: &Layer) -> [f64; 2] {
@@ -267,6 +280,9 @@ fn set_type(s: &mut Session, p: &V) -> Result<V> {
     let n = s.edit("Track Type", None, |proj, _| {
         let mut next = proj.next_id;
         let g = tracker_mut(proj, cid, lid, uid)?;
+        if g.tracker_settings().is_some_and(|st| st.link.is_some()) {
+            return Err(bad("track.setType", "unlink the motion track before changing its channels"));
+        }
         let st = g.tracker_settings_mut().ok_or_else(|| bad("track.setType", "not a tracker"))?;
         if let Some(k) = kind {
             if k == TrackKind::Stabilize {
@@ -315,6 +331,9 @@ fn set_target(s: &mut Session, p: &V) -> Result<V> {
     };
     s.edit("Edit Target", None, |proj, _| {
         let st = tracker_mut(proj, cid, lid, uid)?.tracker_settings_mut().ok_or_else(|| bad("track.setTarget", "not a tracker"))?;
+        if st.link.is_some() {
+            return Err(bad("track.setTarget", "unlink the motion track before editing its target"));
+        }
         if st.kind == TrackKind::Stabilize && target.is_some_and(|t| t != lid) {
             return Err(bad("track.setTarget", "Stabilize applies to the tracked layer"));
         }
@@ -509,6 +528,93 @@ fn apply(s: &mut Session, p: &V) -> Result<V> {
     Ok(json!({"frames": n}))
 }
 
+/// Create or refresh an undoable link by baking the source track onto a target layer.
+/// The tracker stores the original animated transform channels for unlink.
+fn link(s: &mut Session, p: &V) -> Result<V> {
+    let (cid, source, tracker) = current(s, p, "track.link")?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let target = p.get("target").and_then(|value| resolve_layer(comp, value)).ok_or_else(|| bad("track.link", "choose a target layer"))?;
+    let point = p.get("point").map(|v| v.as_u64().ok_or_else(|| bad("track.link", "point must be a positive integer"))).transpose()?.unwrap_or(1);
+    let point = usize::try_from(point).map_err(|_| bad("track.link", "point is too large"))?;
+    if point == 0 || source == target {
+        return Err(bad("track.link", "choose a track point and a different destination layer"));
+    }
+    if s.is_tracking() {
+        return Err(bad("track.link", "wait for track analysis to finish"));
+    }
+    let frames = s.edit("Link Track", None, |proj, _| {
+        let (previous_target, originals) = {
+            let comp = proj.comp(cid).ok_or(EngineError::NoComp)?;
+            let layer = comp.layer(source).ok_or(EngineError::NoComp)?;
+            let (tg, settings) = layer.tracker(tracker).ok_or_else(|| bad("track.link", "tracker is gone"))?;
+            if settings.kind != TrackKind::Transform {
+                return Err(bad("track.link", "only Transform trackers can drive a layer's transform"));
+            }
+            if !settings.position && !settings.rotation && !settings.scale {
+                return Err(bad("track.link", "enable Position, Rotation or Scale in the Tracker panel"));
+            }
+            let analyzed = tg.track_points().nth(point - 1).and_then(|tp| tp.get("attachPoint")).is_some_and(|pr| !pr.keys.is_empty());
+            if !analyzed {
+                return Err(bad("track.link", "analyze that tracker point before linking"));
+            }
+            if settings.link.as_ref().is_some_and(|l| l.target != target) {
+                return Err(bad("track.link", "unlink this tracker from its current target first"));
+            }
+            if comp.layers.iter().any(|l| l.trackers().any(|(g, st)| (l.id, g.uid) != (source, tracker) && st.link.as_ref().is_some_and(|link| link.target == target))) {
+                return Err(bad("track.link", "this destination layer is already linked to another tracker"));
+            }
+            let tr = comp.layer(target).and_then(|l| l.transform()).ok_or_else(|| bad("track.link", "target has no Transform"))?;
+            let previous_target = settings.link.as_ref().map(|l| l.previous_target).unwrap_or(settings.target);
+            let originals = settings.link.as_ref().map(|l| l.originals.clone()).unwrap_or_else(|| {
+                tr.props()
+                    .filter(|pr| {
+                        (settings.position && matches!(pr.match_id.as_str(), "position" | "positionX" | "positionY"))
+                            || (settings.rotation && pr.match_id == "rotation")
+                            || (settings.scale && pr.match_id == "scale")
+                    })
+                    .cloned()
+                    .collect()
+            });
+            if originals.is_empty() {
+                return Err(bad("track.link", "target has no enabled transform channels"));
+            }
+            (previous_target, originals)
+        };
+        let link = TrackLink { target, point, previous_target, originals };
+        restore_link(proj, cid, &link);
+        // Linked channels are controlled solely by the baked samples. Expressions and
+        // earlier keys are restored by track.unlink rather than silently overriding them.
+        if let Some(tr) = proj.comp_mut(cid).and_then(|c| c.layer_mut(target)).and_then(|l| l.transform_mut()) {
+            for original in &link.originals {
+                if let Some(prop) = tr.get_mut(&original.match_id) {
+                    prop.keys.clear();
+                    prop.expr = None;
+                }
+            }
+        }
+        tracker_mut(proj, cid, source, tracker)?.tracker_settings_mut().ok_or_else(|| bad("track.link", "tracker is gone"))?.target = Some(target);
+        let frames = crate::tracking::apply_point(proj, cid, source, tracker, Dims::XY, point).map_err(|e| bad("track.link", e))?;
+        tracker_mut(proj, cid, source, tracker)?.tracker_settings_mut().ok_or_else(|| bad("track.link", "tracker is gone"))?.link = Some(link);
+        Ok(frames)
+    })?;
+    Ok(json!({"frames": frames, "target": target.0, "point": point}))
+}
+
+/// Remove a link and restore the target's previous values, keys and expressions.
+fn unlink(s: &mut Session, p: &V) -> Result<V> {
+    let (cid, source, tracker) = current(s, p, "track.unlink")?;
+    let linked = s.project.comp(cid).and_then(|c| c.layer(source)).and_then(|l| l.tracker(tracker)).and_then(|(_, st)| st.link.clone());
+    let linked = linked.ok_or_else(|| bad("track.unlink", "this tracker has no linked destination"))?;
+    s.edit("Unlink Track", None, |proj, _| {
+        restore_link(proj, cid, &linked);
+        let st = tracker_mut(proj, cid, source, tracker)?.tracker_settings_mut().ok_or_else(|| bad("track.unlink", "tracker is gone"))?;
+        st.target = linked.previous_target;
+        st.link = None;
+        Ok(())
+    })?;
+    Ok(V::Null)
+}
+
 fn reset(s: &mut Session, p: &V) -> Result<V> {
     let (cid, lid, uid) = current(s, p, "track.reset")?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
@@ -549,7 +655,11 @@ fn reset(s: &mut Session, p: &V) -> Result<V> {
 
 fn delete(s: &mut Session, p: &V) -> Result<V> {
     let (cid, lid, uid) = current(s, p, "track.delete")?;
+    let linked = s.project.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| l.tracker(uid)).and_then(|(_, st)| st.link.clone());
     s.edit("Delete Tracker", None, |proj, st| {
+        if let Some(link) = &linked {
+            restore_link(proj, cid, link);
+        }
         let l = layer_mut(proj, cid, lid)?;
         if let Some(mt) = l.props.sub_mut(tracking::MOTION_TRACKERS) {
             mt.children.retain(|c| c.uid() != uid);
