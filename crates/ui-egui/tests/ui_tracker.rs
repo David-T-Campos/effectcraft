@@ -20,6 +20,16 @@ fn ids(h: &Harness<'_, EffectcraftApp>) -> Vec<String> {
     h.state().auto.previous.iter().chain(h.state().auto.elements.iter()).map(|e| e.id.clone()).collect()
 }
 
+#[test]
+fn properties_exposes_tracker_link_for_an_untracked_layer() {
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app());
+    h.state_mut().session.execute("layer.select", json!({"layers": ["Target"]})).unwrap();
+    h.state_mut().show_panel(PanelKind::Properties);
+    h.run_steps(3);
+    assert!(ids(&h).iter().any(|id| id == "properties.track.link"));
+    assert!(!ids(&h).iter().any(|id| id == "properties.track.unlink"));
+}
+
 fn rect(h: &Harness<'_, EffectcraftApp>, id: &str) -> egui::Rect {
     let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}"));
     egui::Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3]))
