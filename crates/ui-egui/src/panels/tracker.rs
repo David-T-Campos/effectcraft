@@ -274,7 +274,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     y += ROW;
     let r1 = Rect::from_min_size(pos2(x0, y), vec2(half, 22.0));
     let r2 = Rect::from_min_size(pos2(x0 + half + 6.0, y), vec2(half, 22.0));
-    if button(app, ui, r1, "Edit Target...", enabled && kind != TrackKind::Raw && kind != TrackKind::Stabilize, "tracker.editTarget") {
+    if settings.as_ref().is_some_and(|s| s.link.is_some()) {
+        if button(app, ui, r1, "Unlink", !app.session.is_tracking(), "tracker.unlink") {
+            run(app, &ctx, "track.unlink", addr.clone());
+        }
+    } else if button(app, ui, r1, "Edit Target...", enabled && kind != TrackKind::Raw && kind != TrackKind::Stabilize, "tracker.editTarget") {
         run(app, &ctx, "track.editTargetDialog", json!({}));
     }
     if button(app, ui, r2, "Options...", enabled, "tracker.options") {
